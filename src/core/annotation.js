@@ -35,6 +35,10 @@ import {
 } from "../shared/util.js";
 import { Catalog, FileSpec, ObjectLoader } from "./obj.js";
 import { collectActions, getInheritableProperty } from "./core_utils.js";
+import {
+  createDefaultAppearance,
+  parseDefaultAppearance,
+} from "./default_appearance.js";
 import { Dict, isDict, isName, isRef, isStream, Name } from "./primitives.js";
 import { ColorSpace } from "./colorspace.js";
 import { OperatorList } from "./operator_list.js";
@@ -995,6 +999,8 @@ class WidgetAnnotation extends Annotation {
     data.defaultAppearance = isString(defaultAppearance)
       ? defaultAppearance
       : "";
+    data.defaultAppearanceData = parseDefaultAppearance(data.defaultAppearance);
+
     const fieldType = getInheritableProperty({ dict, key: "FT" });
     data.fieldType = isName(fieldType) ? fieldType.name : null;
 
@@ -1261,8 +1267,6 @@ class WidgetAnnotation extends Annotation {
   }
 
   async _getAppearance(evaluator, task, annotationStorage) {
-    this._fontName = null;
-
     const isPassword = this.hasFieldFlag(AnnotationFieldFlag.PASSWORD);
     if (!annotationStorage || isPassword) {
       return null;
@@ -1291,12 +1295,13 @@ class WidgetAnnotation extends Annotation {
       // Doing so prevents exceptions and allows saving/printing
       // the file as expected.
       this.data.defaultAppearance = "/Helvetica 0 Tf 0 g";
+      this.data.defaultAppearanceData = parseDefaultAppearance(
+        this.data.defaultAppearance
+      );
     }
 
-    const fontInfo = await this._getFontData(evaluator, task);
-    const [font, fontName] = fontInfo;
-    const fontSize = this._computeFontSize(...fontInfo, totalHeight);
-    this._fontName = fontName;
+    const font = await this._getFontData(evaluator, task);
+    const fontSize = this._computeFontSize(font, totalHeight);
 
     let descent = font.descent;
     if (isNaN(descent)) {
@@ -1367,27 +1372,30 @@ class WidgetAnnotation extends Annotation {
   async _getFontData(evaluator, task) {
     const operatorList = new OperatorList();
     const initialState = {
-      fontSize: 0,
       font: null,
-      fontName: null,
       clone() {
         return this;
       },
     };
 
-    await evaluator.getOperatorList({
-      stream: new StringStream(this.data.defaultAppearance),
-      task,
-      resources: this._fieldResources.mergedResources,
+    const { fontName, fontSize } = this.data.defaultAppearanceData;
+    await evaluator.handleSetFont(
+      this._fieldResources.mergedResources,
+      [fontName, fontSize],
+      /* fontRef = */ null,
       operatorList,
+      task,
       initialState,
-    });
+      /* fallbackFontDict = */ null
+    );
 
-    return [initialState.font, initialState.fontName, initialState.fontSize];
+    return initialState.font;
   }
 
-  _computeFontSize(font, fontName, fontSize, height) {
-    if (fontSize === null || fontSize === 0) {
+  _computeFontSize(font, height) {
+    let fontSize = this.data.defaultAppearanceData.fontSize;
+    if (!fontSize) {
+      const { fontColor, fontName } = this.data.defaultAppearanceData;
       let capHeight;
       if (font.capHeight) {
         capHeight = font.capHeight;
@@ -1406,15 +1414,11 @@ class WidgetAnnotation extends Annotation {
       // 1.5 * capHeight * fontSize seems to be a good value for lineHeight
       fontSize = Math.max(1, Math.floor(height / (1.5 * capHeight)));
 
-      let fontRegex = new RegExp(`/${fontName}\\s+[0-9.]+\\s+Tf`);
-      if (this.data.defaultAppearance.search(fontRegex) === -1) {
-        // The font size is missing
-        fontRegex = new RegExp(`/${fontName}\\s+Tf`);
-      }
-      this.data.defaultAppearance = this.data.defaultAppearance.replace(
-        fontRegex,
-        `/${fontName} ${fontSize} Tf`
-      );
+      this.data.defaultAppearance = createDefaultAppearance({
+        fontSize,
+        fontName,
+        fontColor,
+      });
     }
     return fontSize;
   }
@@ -1453,34 +1457,36 @@ class WidgetAnnotation extends Annotation {
       PDFJSDev.test("!PRODUCTION || TESTING")
     ) {
       assert(
-        this._fontName !== undefined,
-        "Expected `_getAppearance()` to have been called."
+        this.data.defaultAppearanceData,
+        "Expected `_defaultAppearanceData` to have been set."
       );
     }
     const {
       localResources,
-      acroFormResources,
       appearanceResources,
+      acroFormResources,
     } = this._fieldResources;
 
-    if (!this._fontName) {
+    const fontNameStr =
+      this.data.defaultAppearanceData &&
+      this.data.defaultAppearanceData.fontName.name;
+    if (!fontNameStr) {
       return localResources || Dict.empty;
     }
 
     for (const resources of [localResources, appearanceResources]) {
       if (resources instanceof Dict) {
         const localFont = resources.get("Font");
-        if (localFont instanceof Dict && localFont.has(this._fontName)) {
+        if (localFont instanceof Dict && localFont.has(fontNameStr)) {
           return resources;
         }
       }
     }
-
     if (acroFormResources instanceof Dict) {
       const acroFormFont = acroFormResources.get("Font");
-      if (acroFormFont instanceof Dict && acroFormFont.has(this._fontName)) {
+      if (acroFormFont instanceof Dict && acroFormFont.has(fontNameStr)) {
         const subFontDict = new Dict(xref);
-        subFontDict.set(this._fontName, acroFormFont.getRaw(this._fontName));
+        subFontDict.set(fontNameStr, acroFormFont.getRaw(fontNameStr));
 
         const subResourcesDict = new Dict(xref);
         subResourcesDict.set("Font", subFontDict);
@@ -2001,7 +2007,7 @@ class ButtonWidgetAnnotation extends WidgetAnnotation {
     }
     return {
       id: this.data.id,
-      value: this.data.fieldValue || null,
+      value: this.data.fieldValue || "Off",
       defaultValue: this.data.defaultFieldValue,
       exportValues,
       editable: !this.data.readOnly,
